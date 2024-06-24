@@ -1,0 +1,434 @@
+---
+title: "Hartmann_BiolCons_2024"
+author: "Arik Hartmann"
+date: "4/14/2024"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r Libraries}
+library(arm)
+library(ggplot2)
+library(tibble)
+library(tidyverse)
+library(vegan)
+library(epiR)
+library(MetBrewer)
+library(ggpubr)
+library(MASS)
+library(gridExtra)
+library(lme4) # for models
+library(multcomp) #for glm post-hoc
+library(emmeans) #for post-hoc coefficient estimation
+library(MuMIn)
+library(jtools) # for exporting model using summ()
+library(huxtable)
+library(stargazer)
+library(sjPlot)
+library(patchwork)
+library(zoo)
+
+```
+
+
+```{r Load data and wrangle}
+
+
+lp_amph <- read.csv("LP_amphib_clean2.csv")
+
+lp_amph<- lp_amph %>% filter(pond_ID!=34)
+
+lp_amph <- lp_amph %>% filter(location=="LP")
+# count records per species
+species_counts <- lp_amph %>%
+  group_by(spp) %>%
+  tally
+
+species_counts
+
+# add in wetland variable type
+lp_amph <- lp_amph %>% mutate(wetland_type = if_else(pond_ID %in% c(48,22), "Semi-permanent", "Ephemeral"))
+
+#order metamorphic stages
+lp_amph$met_stat <- factor(lp_amph$met_stat, levels = c("pre", "mid", "post"))
+
+# count species richness
+
+diversity <- lp_amph %>% group_by(mo_yr, pond_ID, wetland_type) %>% summarise(numspp = n_distinct(spp))
+
+# get names of the species with counts >= 5
+frequent_species <-  species_counts %>% filter(n >= 5) %>% dplyr::select(spp)
+frequent_species
+
+# filter out the less-frequent species and store in a new object called freq_dat
+freq_dat <- lp_amph %>% filter(spp %in% frequent_species$spp)
+
+#add in species richness
+freq_dat <- full_join(freq_dat, diversity)
+
+# factor to keep Frogs and salamanders together
+freq_dat$spp <- factor(freq_dat$spp, levels = c("ACGR", "LICA", "LICP", "LIGR", "LISP", "PSOR", "AMTA", "AMTI", "NOPE", "NOVI","PSST", "SILA"))
+
+#Factor to keep infections in order
+freq_dat$status <- factor(freq_dat$status, levels = c("Uninfected", "Bd", "Bd-Pk", "Bd-Rv","Bd-Pk-Rv", "Pk", "Rv-Pk","Rv"))
+
+
+# Setting color palettes ----
+
+# color palette for main pathogen comparisons
+pal <- met.brewer("Hiroshige", n=15)
+
+pal_com <- c("Uninfected"="grey75","Bd"=pal[9], "Bd-Pk"=pal[12], 
+             "Bd-Rv"=pal[15], "Pk"=pal[7], "Rv"=pal[1], "Rv-Pk"=pal[4])
+
+pal2 <- met.brewer("Hiroshige", n=11)[c("Bd"=7,"Pk"=4, "Rv"=1)]
+
+pal5 <- met.brewer("Pissaro", n=7)[c("Ephemeral"=6, "Permanent"=2)]
+
+```
+
+```{R code for models}
+
+# Infection probability models
+# Variables
+# species (12) 
+# life stage (3) Pre, Mid, and Post Metamorphic
+# season (2) cool-dry, warm-wet
+# Confection status (3) Infection with nonfocal A, Nonfocal B, or Single infected
+# Wetland type (2) Semi-permanent/Permanent 
+# Species richness (1) Count 
+# Two-way interactions between Lifestage x Species
+
+
+# Bd probability 
+factor_cols = c("met_stat","rv_status", "pk_status", "wetland_type", "season", "pond_ID")
+dat.bdglm = freq_dat %>% 
+  mutate(across(all_of(factor_cols), factor))
+
+
+bdfull <- glm(bd_status~spp*met_stat+pk_status+rv_status+season+wetland_type+numspp, 
+             data=dat.bdglm, family="binomial"(link = "logit"), na.action = "na.fail")
+
+bdfull <- bayesglm(bd_status~spp*met_stat+pk_status+rv_status+season+pond_ID+wetland_type+numspp, 
+             data=dat.bdglm, family="binomial"(link = "logit"), na.action = "na.fail")
+
+bd_stat <- dredge(bdfull, rank="AICc")
+
+bd_stat[1:8]
+summary(bd_stat)
+
+#models with delta.aicc < 4
+summary(model.avg(bd_stat, subset = delta < 2))
+
+#subset best model
+
+bdstat_best <- get.models(bd_stat, 3)[[1]]
+
+
+summary(bdstat_best)
+
+summary(aov(bdstat_best))
+
+aov_bdstat <- aov(bdstat_best)
+
+em1 <- emmeans(aov_bdstat, "met_stat", infer=T)
+em1
+
+contrast(em1, "pairwise", adjust="Tukey")
+
+em2 <- emmeans(aov_bdstat, "season", infer=T)
+contrast(em2, "pairwise", adjust="Tukey")
+
+plot_model(bdstat_best, type="emm", terms =c("met_stat"))
+
+
+# Pk probability ----
+
+factor_cols = c("met_stat","rv_status", "bd_status", "wetland_type", "season", "pond_ID")
+pkglm = freq_dat %>% 
+  mutate(across(all_of(factor_cols), factor))
+
+pkglm$pk_prob <- pkglm$pk_ge > 0
+
+pkfull <- glm(pk_prob~spp+met_stat+wetland_type
+                   +rv_status+bd_status+pond_ID+season+numspp, 
+             data=pkglm, family="binomial", na.action = "na.fail")
+
+pkfull <- bayesglm(pk_status~spp*met_stat+wetland_type
+                   +rv_status+bd_status+pond_ID+season+numspp, 
+             data=pkglm, family="binomial"(link="logit"), na.action = "na.fail")
+
+pknull <- bayesglm(pk_status~1, data=pkglm, family="binomial"(link="logit"), na.action = "na.fail")
+
+
+pk_stat <- dredge(pkfull, rank="AICc")
+
+pk_stat[1:8]
+
+summary(pk_stat)
+
+#models with delta.aicc < 4
+summary(model.avg(pk_stat, subset = delta < 2))
+
+pkstat_best <- get.models(pk_stat, 1)[[1]]
+summary(pkstat_best)
+
+pkstat_best1 <- get.models(pk_stat, 1)[[1]]
+
+anova(pkstat_best, pkstat_best1, test="LRT")
+anova(pkstat_best, pknull, test="LRT")
+
+aov(pkstat_best, type=2)
+
+aov_pkstat <- aov(pkstat_best)
+
+summary(aov_pkstat)
+
+kruskal.test(pk_status~season, data=pkglm)
+
+# number of species, species identity are significant
+pk2 <- emmeans(aov_pkstat, "season", infer=T)
+summary(pk2)
+
+
+pk2 <- emmeans(aov_pkstat, "met_stat", infer=T)
+summary(pk2)
+
+contrast(pk2, "pairwise", infer=T)
+
+
+plot_model(pkstat_best, type="pred", terms =c("numspp", "season"))
+
+
+# Rv probability ----
+factor_cols = c("met_stat","bd_status", "pk_status", "wetland_type", "season", "pond_ID")
+dat.rvglm = freq_dat %>% 
+  mutate(across(all_of(factor_cols), factor))
+
+dat.rvglm$bd_status <- factor(dat.rvglm$bd_status, levels = c(1,0))
+
+rvfull <- bayesglm(rv_status~spp*met_stat+bd_status+pk_status+wetland_type+pond_ID+season+numspp, 
+             data=dat.rvglm, family="binomial"(link="logit"), na.action = "na.fail")
+
+rv_stat <- dredge(rvfull, rank="AICc")
+
+rv_stat[1:8]
+summary(rv_stat)
+
+#models with delta.aicc < 
+summary(model.avg(rv_stat, subset = delta < 2))
+
+rvstat_best <- get.models(rv_stat, 2)[[1]]
+summary(rvstat_best)
+
+
+aov_rvstat <- aov(rvstat_best)
+summary(aov_rvstat)
+
+
+rv1 <- emmeans(aov_rvstat, "bd_status", infer=T)
+summary(rv1)
+
+contrast(rv1, "pairwise", adjust="Tukey")
+
+
+# GLMs for load ----
+# Log transform load data to see if they are compared with one another using Pearson's correlation
+
+#Load by life stage
+#Load by species
+#Load by wetland type
+#Species diversity
+
+# Are coinfection loads associated?  
+bdrv <- lp_amph %>% filter(status=="Bd-Rv") 
+
+cor.test(log10(bdrv$bd_int), log10(bdrv$rv_int), 
+                method = "pearson")
+#(n=5, -0.00227, p=0.983)
+
+bdpk <- lp_amph %>% filter(status=="Bd-Pk") 
+
+cor.test(log10(bdpk$bd_int), log10(bdpk$pk_int), 
+         method = "pearson")
+
+#(n=4, -1.1231, p=0.3781)
+
+lp_amph %>% filter(wetland_type =="Ephemeral") %>% summarise(counts = n())
+lp_amph %>% filter(wetland_type =="Ephemeral" & status=="Uninfected") %>% summarise(counts = n())
+lp_amph %>% filter(wetland_type =="Ephemeral" & status!="Uninfected") %>% summarise(counts = n())
+
+
+lp_amph %>% filter(wetland_type =="Semi-permanent") %>% summarise(counts = n())
+lp_amph %>% filter(wetland_type =="Semi-permanent" & status=="Uninfected") %>% summarise(counts = n())
+lp_amph %>% filter(wetland_type =="Semi-permanent" & status!="Uninfected") %>% summarise(counts = n())
+
+
+
+M <- as.table(rbind(c(112, 44, 68), c(197, 173, 24)))
+dimnames(M) <- list(wetland = c("E", "S"),
+                    states = c("N","Uninfected", "Infected"))
+
+(Xsq <- chisq.test(M))
+Xsq$observed   # observed counts (same as M)
+Xsq$expected   # expected counts under the null
+Xsq$residuals  # Pearson residuals
+Xsq$stdres     # standardized residuals
+
+
+# Models for pathogen load
+
+rv_pos <- freq_dat %>% filter(rv_ge>0)
+bd_pos <- freq_dat %>% filter(bd_ge>0)
+pk_pos <- freq_dat %>% filter(pk_ge>0)
+
+
+
+
+#Load by life stage
+#Load by species
+#Load by wetland type
+#Species diversity
+
+
+# models for Bd load
+factor_cols = c("met_stat","rv_status", "bd_status", "wetland_type", "season", "pond_ID")
+bdglm2 = bd_pos %>% 
+  mutate(across(all_of(factor_cols), factor))
+
+
+globalbd <- glm(log10(bd_int)~spp+rv_status+met_stat+wetland_type+numspp, 
+               data=bd_pos, na.action = "na.fail")
+ddbd <- dredge(globalbd, rank = "AICc")
+ddbd[1:5]
+
+bdload_best <- get.models(ddbd, 2)[[1]]
+aov_bdload <- aov(bdload_best)
+summary(aov_bdload)
+
+bdl1 <- emmeans(aov_bdload, "met_stat", infer=T)
+contrast(bdl1, "pairwise", adjust="Tukey")
+
+
+bdl2 <- emmeans(aov_bdload, "wetland_type", infer=T)
+contrast(bdl2, "pairwise", adjust="Tukey")
+
+plot_model(bdload_best, type="pred", terms =c("met_stat", "wetland_type"))
+
+# models for Pr load ----
+factor_cols = c("met_stat","rv_status", "bd_status", "wetland_type", "season", "pond_ID")
+prglm2 = pk_pos %>% 
+  mutate(across(all_of(factor_cols), factor))
+
+prglm2$log_pk <- as.numeric(prglm2$log_pk)
+
+globalpk <- lm(log10(pk_int)~spp+wetland_type+numspp+met_stat+pond_ID, 
+               data=prglm2, na.action = "na.fail")
+
+ddpk <- dredge(globalpk, rank = "AICc")
+ddpk[1:5]
+
+pkload_best <- get.models(ddpk, 2)[[1]]
+aov_pkload <- aov(pkload_best)
+summary(aov_pkload)
+
+pr1 <- emmeans(aov_pkload, "wetland_type", infer=T)
+pr1
+
+contrast(pr1, "pairwise", adjust="Tukey")
+
+
+plot_model(pkload_best, type="emm", terms =c("wetland_type"))
+
+
+# models for Rv load
+factor_cols = c("met_stat","pk_status", "bd_status", "wetland_type", "season", "pond_ID")
+rvglm2 = rv_pos %>% 
+  mutate(across(all_of(factor_cols), factor))
+
+globalrv <- glm(log(rv_~spp+bd_status+met_stat+numspp, 
+               data=rvglm2, na.action = "na.fail")
+
+ddrv <- dredge(globalrv, rank = "AICc")
+ddrv[1:5]
+
+# models for Rv load ----
+globalrv <- glm(log10(rv_int)~spp+bd_status+met_stat+numspp, 
+               data=rv_pos, na.action = "na.fail")
+
+ddrv <- dredge(globalrv, rank = "AICc")
+ddrv[1:5]
+# best
+
+rvload_best <- get.models(ddrv, 1)[[1]]
+
+aov_rvload <- aov(rvload_best)
+summary(aov_rvload)
+rvl1 <- emmeans(aov_rvload, "bd_status", infer=T)
+contrast(rvl1, "pairwise", adjust="Tukey")
+
+```
+
+```{R code for summary tables}
+
+lp_bd <- lp_amph %>% summarise(bd_pos = sum(bd_status==1))                                           
+lp_rv <- lp_amph %>% summarise(rv_pos = sum(rv_status==1))                                           
+lp_pk <- lp_amph %>% summarise(pk_pos = sum(pk_status==1))                                           
+
+lp_all<- lp_amph %>% summarise(n_total = sum(n()))
+
+lp_all$bd_n <- lp_bd$bd_pos
+lp_all$pk_n <- lp_pk$pk_pos
+lp_all$rv_n <- lp_rv$rv_pos
+
+tmp <- as.matrix(cbind(lp_all$bd_n, lp_all$n_total))
+
+tmp <- epi.conf(tmp, ctype = "prevalence", method = "exact", N = 1000, design = 1, 
+                conf.level = 0.95)
+
+lp_bd <- cbind(lp_bd, tmp)
+head(lp_bd)
+
+
+# repeat for Rv
+
+tmp <- as.matrix(cbind(lp_all$rv_n, lp_all$n_total))
+
+tmp <- epi.conf(tmp, ctype = "prevalence", method = "exact", N = 1000, design = 1, 
+                conf.level = 0.95)
+
+
+lp_rv <- cbind(lp_rv, tmp)
+head(lp_rv)
+
+# repeat for Pk
+
+tmp <- as.matrix(cbind(lp_all$pk_n, lp_all$n_total))
+
+tmp <- epi.conf(tmp, ctype = "prevalence", method = "exact", N = 1000, design = 1, 
+                conf.level = 0.95)
+
+
+lp_pk <- cbind(lp_pk, tmp)
+head(lp_pk)
+
+# now set each pathogen stat as a factor
+
+#eb3 <- lp_rv %>% mutate(Infection="Rv") %>% bind_rows(lp_bd %>% mutate(Infection="Bd"))%>% 
+#  bind_rows(lp_pk %>% mutate(Infection="Pk"))
+
+```
